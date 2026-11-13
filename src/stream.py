@@ -7,6 +7,7 @@
 - 분할 화면이면 원본도 전송된다. 개발용으로만 쓰고, 실제 장치에서는 --single 과 함께 쓸 것.
 - 인증이 없으므로 같은 네트워크의 누구나 볼 수 있다. 신뢰할 수 있는 네트워크(개인 핫스팟 등)에서만 사용.
 """
+import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -17,6 +18,16 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>DONT LOOK ME l
 <style>body{margin:0;background:#111;color:#ddd;font-family:sans-serif;text-align:center}
 img{max-width:100%;height:auto;margin-top:8px}p{margin:6px;font-size:14px}</style></head>
 <body><p>DONT LOOK ME 실시간 화면 (새로고침하면 다시 연결)</p><img src="/stream.mjpg"></body></html>"""
+
+
+class _DualStackServer(ThreadingHTTPServer):
+    """IPv4와 IPv6 접속을 모두 받는다. (아이폰 핫스팟 등에서는 PC가 IPv6로만 파이에 닿는 경우가 있음)"""
+    address_family = socket.AF_INET6
+    daemon_threads = True
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
 
 
 class MJPEGStreamer:
@@ -67,8 +78,11 @@ class MJPEGStreamer:
                 except (BrokenPipeError, ConnectionResetError):
                     pass  # 브라우저 탭을 닫음
 
-        self.server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
-        self.server.daemon_threads = True
+        try:
+            self.server = _DualStackServer(("::", port), Handler)
+        except OSError:  # IPv6를 못 쓰는 환경
+            self.server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+            self.server.daemon_threads = True
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def update(self, frame) -> None:
