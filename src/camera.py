@@ -27,7 +27,8 @@ def now_ns() -> int:
 class PiCamera:
     """Picamera2를 cv2.VideoCapture와 비슷한 형태로 감싼다."""
 
-    def __init__(self, width: int, height: int, fps: int, low_latency: bool = False):
+    def __init__(self, width: int, height: int, fps: int, low_latency: bool = False,
+                 autofocus: bool = True):
         from picamera2 import Picamera2  # 라즈베리파이에서만 필요
 
         self.cam = Picamera2()
@@ -49,6 +50,11 @@ class PiCamera:
         )
         self.cam.configure(cfg)
         self.cam.start()
+        # Camera Module 3는 자동초점 렌즈인데 기본값은 초점 고정(LensPosition 1.0 = 약 1m)이라
+        # 거리가 다르면 영상이 흐려진다. 흐린 영상은 YOLO가 사람을 놓치는 원인이 되므로 연속 AF를 켠다.
+        # (2026-11-13 Pi 실측: AF 끔 선명도 28.6 -> 연속 AF 150.7)
+        if autofocus and "AfMode" in self.cam.camera_controls:
+            self.cam.set_controls({"AfMode": 2})  # 2 = Continuous
         self.last_meta = {}
 
     def isOpened(self) -> bool:
@@ -76,10 +82,11 @@ class PiCamera:
         self.cam.close()
 
 
-def open_source(source: str, width: int, height: int, fps: int, low_latency: bool = False):
+def open_source(source: str, width: int, height: int, fps: int, low_latency: bool = False,
+                autofocus: bool = True):
     """'picamera', 웹캠 번호, 영상 파일/스트림 경로를 연다."""
     if source == "picamera":
-        return PiCamera(width, height, fps, low_latency)
+        return PiCamera(width, height, fps, low_latency, autofocus)
     src = int(source) if source.isdigit() else source
     cap = cv2.VideoCapture(src)
     if isinstance(src, int):

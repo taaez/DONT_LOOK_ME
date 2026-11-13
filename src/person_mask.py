@@ -23,6 +23,7 @@
 """
 import argparse
 import csv
+import signal
 import time
 from pathlib import Path
 
@@ -128,11 +129,22 @@ def parse_args() -> argparse.Namespace:
                    help="프레임별 진단 기록 CSV 경로 (예: runs/live.csv). tools/analyze_log.py로 분석")
     p.add_argument("--low-latency", action="store_true",
                    help="Picamera2 버퍼/큐를 줄여 오래된 프레임이 쌓이지 않게 한다 (지연 비교 실험용)")
+    p.add_argument("--no-af", action="store_true", help="Camera Module 3 연속 자동초점 끄기")
+    p.add_argument("--stream", type=int, default=0, metavar="PORT",
+                   help="브라우저 실시간 화면 포트 (예: 8000 -> http://<파이주소>:8000). 0이면 끔")
     p.add_argument("--export", choices=["ncnn", "onnx"], help="모델 변환 후 종료")
     return p.parse_args()
 
 
+def _stop(*_):
+    raise KeyboardInterrupt
+
+
 def main() -> None:
+    # Ctrl+C(SIGINT)뿐 아니라 kill(SIGTERM)로 끝내도 요약 출력/파일 정리를 하도록 한다.
+    # (백그라운드 실행은 SIGINT가 무시되므로 'pkill -f person_mask.py'로 끝낸다)
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, _stop)
     args = parse_args()
     if args.export:
         export_model(args)
@@ -190,9 +202,18 @@ def main() -> None:
             cv2.waitKey(0)
         return
 
-    cap = open_source(args.source, args.width, args.height, args.fps, args.low_latency)
+    cap = open_source(args.source, args.width, args.height, args.fps, args.low_latency,
+                      autofocus=not args.no_af)
     if not cap.isOpened():
         raise SystemExit(f"소스를 열 수 없음: {args.source}")
+
+    streamer = None
+    if args.stream:
+        from stream import MJPEGStreamer
+        streamer = MJPEGStreamer(args.stream)
+        print(f"실시간 화면: 브라우저에서 http://<이 기기 주소>:{args.stream} "
+              f"(예: http://dontlookme.local:{args.stream})"
+              + ("" if args.single else "  * 분할 화면이라 원본도 전송됨 (개발용)"))
 
     if not args.no_show and args.fullscreen:
         cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
@@ -275,6 +296,9 @@ def main() -> None:
                 written += 1
                 prev_view = view
 
+            if streamer:
+                streamer.update(view)
+
             quit_requested = False
             if not args.no_show:
                 cv2.imshow(WINDOW, view)
@@ -338,6 +362,8 @@ def main() -> None:
             writer.release()
         if log_file:
             log_file.close()
+        if streamer:
+            streamer.close()
         cv2.destroyAllWindows()
 
         elapsed = t_end - t0

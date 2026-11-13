@@ -13,7 +13,8 @@
 DONT_LOOK_ME/
 ├── src/
 │   ├── person_mask.py     # 메인 프로그램 (카메라 → YOLO 분할 → 사람 마스킹 → 출력/저장, --log 진단 기록)
-│   ├── camera.py          # 카메라 입력 (Picamera2 / 웹캠 / 영상 파일)
+│   ├── camera.py          # 카메라 입력 (Picamera2 / 웹캠 / 영상 파일), 연속 자동초점
+│   ├── stream.py          # 브라우저 실시간 화면 (MJPEG)
 │   ├── sysmon.py          # CPU 사용률·온도·클럭·스로틀 측정
 │   └── metrics.py         # 진단 계산 공용 함수
 ├── tools/
@@ -39,6 +40,9 @@ pip install ultralytics
 
 # SSH 터미널: 화면 없이 원본|마스크 비교 영상 저장 (Ctrl+C로 종료하면 실행 요약 출력)
 python src/person_mask.py --source picamera --imgsz 320 --no-show --save compare.mp4
+
+# 브라우저로 실시간 화면 보기 (같은 네트워크의 PC에서 http://dontlookme.local:8000)
+python src/person_mask.py --source picamera --imgsz 320 --no-show --stream 8000
 
 # 실제 장치 출력: 마스크 처리본만 전체화면
 python src/person_mask.py --source picamera --imgsz 320 --single --fullscreen
