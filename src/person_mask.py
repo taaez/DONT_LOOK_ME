@@ -280,6 +280,13 @@ def main() -> None:
 
             t_out0 = time.perf_counter()
             view = out if args.single else side_by_side(frame, out, args.view_width)
+            if not args.single:
+                # 개발용 분할 화면에만: 진단 로그(t_s, frame)와 녹화 영상을 맞춰 보기 위한 표시
+                label = f"t={t_cap - t0:6.1f}s  #{n + 1}  persons={info.get('n_person', '-')}"
+                cv2.putText(view, label, (10, view.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                            (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.putText(view, label, (10, view.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                            (0, 255, 255), 1, cv2.LINE_AA)
 
             if args.save and writer is None:
                 h, w = view.shape[:2]
