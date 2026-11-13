@@ -37,10 +37,15 @@ class PiCamera:
         from picamera2 import Picamera2  # 라즈베리파이에서만 필요
 
         self.cam = Picamera2()
-        # "BGR888"은 OpenCV가 쓰는 채널 순서(BGR)로 바로 나온다
+        # 주의: Picamera2(libcamera) 포맷 이름은 직관과 반대다.
+        #   "RGB888" -> capture_array() 배열이 [B, G, R] 순서 (OpenCV가 기대하는 순서)
+        #   "BGR888" -> capture_array() 배열이 [R, G, B] 순서 (빨강/파랑이 뒤바뀜)
+        # 출처: Picamera2 Library Guide, "Image Formats"
+        # 여기서 RGB888을 쓰므로 뒤에서 cvtColor를 추가로 하면 안 된다 (다시 뒤바뀜).
+        controls = {"FrameRate": fps} if fps > 0 else {}
         cfg = self.cam.create_video_configuration(
-            main={"size": (width, height), "format": "BGR888"},
-            controls={"FrameRate": fps},
+            main={"size": (width, height), "format": "RGB888"},
+            controls=controls,
         )
         self.cam.configure(cfg)
         self.cam.start()
@@ -181,11 +186,37 @@ def main() -> None:
     is_file = Path(args.source).is_file()
     frame_interval = 1.0 / args.fps if args.fps > 0 else 0.0
     last_shape = (args.height, args.width, 3)
+
+    # ---- 녹화 설정 ----
+    # 실시간 소스(카메라)는 AI 처리 속도가 파일 FPS보다 느릴 수 있다.
+    # 루프마다 1프레임만 쓰면 "실제 30초 -> 영상 10초"처럼 빨리감기가 된다.
+    # 그래서 실제 경과 시간(벽시계)에 맞춰, 새 프레임이 나오기 전까지의 빈 시간은
+    # 직전 프레임을 반복 기록해 채운다. (영상 길이 = 실제 녹화 시간)
+    # 영상 파일 입력은 실시간이 아니므로 원본 FPS로 1:1 기록한다.
+    if is_file:
+        record_fps = cap.get(cv2.CAP_PROP_FPS) or args.fps or 15
+    else:
+        record_fps = args.fps if args.fps > 0 else 15
     writer = None
+    record_start = None   # 첫 프레임 캡처 시각
+    written = 0           # 파일에 실제로 쓴 프레임 수 (반복 포함)
+    duplicated = 0        # 시간 맞추기용으로 반복 기록한 프레임 수
+    prev_view = None
+
+    def write_until(t: float) -> None:
+        """record_start부터 시각 t까지 파일 프레임이 부족하면 직전 프레임으로 채운다."""
+        nonlocal written, duplicated
+        target = int((t - record_start) * record_fps)
+        while prev_view is not None and written < target:
+            writer.write(prev_view)
+            written += 1
+            duplicated += 1
+
     n, t0, next_t = 0, time.perf_counter(), time.perf_counter()
     try:
         while True:
             ok, frame = cap.read()
+            t_cap = time.perf_counter()  # 이 프레임이 실제로 들어온 시각
             if not ok:
                 if is_file:  # 영상 파일 끝
                     break
@@ -200,10 +231,18 @@ def main() -> None:
 
             if args.save and writer is None:
                 h, w = view.shape[:2]
-                fps = cap.get(cv2.CAP_PROP_FPS) or args.fps or 15
-                writer = cv2.VideoWriter(args.save, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+                writer = cv2.VideoWriter(args.save, cv2.VideoWriter_fourcc(*"mp4v"), record_fps, (w, h))
+                if not writer.isOpened():
+                    raise SystemExit(f"영상 저장 파일을 열 수 없음: {args.save}")
+                record_start = t_cap
+                print(f"녹화 시작: {args.save} ({record_fps:g} FPS, "
+                      f"{'원본 1:1 기록' if is_file else '실제 시간 동기화'})")
             if writer:
+                if not is_file:
+                    write_until(t_cap)  # 이 프레임이 찍힌 시각까지 빈 구간 채우기
                 writer.write(view)
+                written += 1
+                prev_view = view
 
             n += 1
             if n % 30 == 0:
@@ -220,11 +259,26 @@ def main() -> None:
                 time.sleep(wait)
             else:
                 next_t = time.perf_counter()
+    except KeyboardInterrupt:  # Ctrl+C로 정상 종료 (요약을 출력하고 파일을 닫는다)
+        pass
     finally:
+        t_end = time.perf_counter()
         cap.release()
         if writer:
+            if not is_file:
+                write_until(t_end)  # 마지막 프레임 이후 ~ 종료 시점까지 채우기
             writer.release()
         cv2.destroyAllWindows()
+
+        elapsed = t_end - t0
+        print("\n===== 실행 요약 =====")
+        print(f"실제 경과 시간  : {elapsed:.1f} 초")
+        print(f"AI 처리 프레임  : {n} 장 (평균 {n / elapsed if elapsed > 0 else 0:.1f} FPS)")
+        if writer:
+            print(f"파일 기록 프레임: {written} 장 @ {record_fps:g} FPS "
+                  f"-> 재생 길이 {written / record_fps:.1f} 초")
+            if not is_file:
+                print(f"  (그중 시간 맞추기용 반복 프레임: {duplicated} 장)")
 
 
 if __name__ == "__main__":
