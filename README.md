@@ -61,5 +61,8 @@ python tools/analyze_log.py runs/live.csv --plot runs/live.png
 
 ## 알려진 한계
 
+앞뒤 프레임으로 검출 누락을 보완하는 별도 실험 실행기: [docs/트래킹.md](docs/트래킹.md).
+`python src/person_mask_tracking.py --source 0`으로 실행하며, 누락 번호와 트래킹 적용 상태를 화면에 표시합니다.
+
 - 오류 없이 사람을 **검출하지 못한 프레임**은 원본이 그대로 출력됩니다 (fail-safe는 오류에만 동작).
 - 분할 화면(기본)과 `compare.mp4`에는 원본이 포함됩니다. 검증용으로만 쓰고, 실제 장치에서는 `--single`을 사용하세요.
