@@ -11,9 +11,19 @@
 
 ```
 DONT_LOOK_ME/
-├── src/person_mask.py     # 메인 프로그램 (카메라 → YOLO 분할 → 사람 마스킹 → 출력/저장)
+├── src/
+│   ├── person_mask.py     # 메인 프로그램 (카메라 → YOLO 분할 → 사람 마스킹 → 출력/저장, --log 진단 기록)
+│   ├── camera.py          # 카메라 입력 (Picamera2 / 웹캠 / 영상 파일)
+│   ├── sysmon.py          # CPU 사용률·온도·클럭·스로틀 측정
+│   └── metrics.py         # 진단 계산 공용 함수
+├── tools/
+│   ├── record_raw.py      # AI 없이 원본 녹화 (기준선 + 테스트 영상)
+│   ├── analyze_log.py     # --log CSV 분석: [A]간격 / [B]CPU / [C]모델 원인 판정
+│   └── offline_eval.py    # 모든 프레임 오프라인 평가 + 기준 모델 대비 노출 프레임 비율
 ├── weights/yolov8n-seg.pt # 모델 가중치
-├── docs/실행방법.md        # 설치·실행·옵션·문제 해결 상세 문서
+├── docs/
+│   ├── 실행방법.md         # 설치·실행·옵션·문제 해결
+│   └── 프레임진단.md       # 마스킹 누락 원인 진단 방법
 └── requirements.txt
 ```
 
@@ -35,6 +45,15 @@ python src/person_mask.py --source picamera --imgsz 320 --single --fullscreen
 ```
 
 자세한 내용은 [docs/실행방법.md](docs/실행방법.md)를 참고하세요.
+
+## 프레임 진단
+
+```bash
+python src/person_mask.py --source picamera --imgsz 320 --no-show --log runs/live.csv
+python tools/analyze_log.py runs/live.csv --plot runs/live.png
+```
+
+마스킹 누락의 원인을 간격 / CPU / 모델로 나눠서 봅니다. 자세한 절차는 [docs/프레임진단.md](docs/프레임진단.md)를 참고하세요.
 
 ## 알려진 한계
 

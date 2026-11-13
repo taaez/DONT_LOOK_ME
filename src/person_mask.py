@@ -5,7 +5,7 @@
 - 마스크 경계를 dilate로 넓혀서 윤곽 밖으로 삐져나오는 몸을 줄인다.
 - 추론/카메라 오류가 나면 원본을 내보내지 않고 검은 화면을 낸다 (fail-safe).
 
-사용법
+사용법 (저장소 최상위 폴더에서)
     python src/person_mask.py --source 0                     # USB 웹캠 (왼쪽 원본 | 오른쪽 마스크 분할 화면)
     python src/person_mask.py --source picamera              # 라즈베리파이 CSI 카메라 (Picamera2), 분할 화면
     python src/person_mask.py --source video.mp4
@@ -13,11 +13,16 @@
     python src/person_mask.py --source picamera --single --fullscreen --fps 15 --imgsz 320   # 라즈베리파이 출력용 (마스크만)
     python src/person_mask.py --source 0 --no-show           # 화면 없이 FPS만 측정
 
+프레임 진단 로그 (프레임마다 처리 시간/검출 결과/카메라 타임스탬프/CPU 상태를 CSV로 기록)
+    python src/person_mask.py --source picamera --imgsz 320 --no-show --log runs/live.csv
+    python tools/analyze_log.py runs/live.csv
+
 라즈베리파이에서 빠르게 돌리려면 NCNN으로 변환해서 쓴다 (한 번만 실행).
     python src/person_mask.py --export ncnn --imgsz 320
     python src/person_mask.py --source picamera --weights weights/yolov8n-seg_ncnn_model --imgsz 320
 """
 import argparse
+import csv
 import time
 from pathlib import Path
 
@@ -25,67 +30,60 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+from camera import now_ns, open_source
+from sysmon import SysMonitor
+
 DEFAULT_WEIGHTS = Path(__file__).resolve().parent.parent / "weights" / "yolov8n-seg.pt"
 PERSON_CLASS = 0
 WINDOW = "person_mask"
 
-
-class PiCamera:
-    """Picamera2를 cv2.VideoCapture와 비슷한 read()/release() 형태로 감싼다."""
-
-    def __init__(self, width: int, height: int, fps: int):
-        from picamera2 import Picamera2  # 라즈베리파이에서만 필요
-
-        self.cam = Picamera2()
-        # 주의: Picamera2(libcamera) 포맷 이름은 직관과 반대다.
-        #   "RGB888" -> capture_array() 배열이 [B, G, R] 순서 (OpenCV가 기대하는 순서)
-        #   "BGR888" -> capture_array() 배열이 [R, G, B] 순서 (빨강/파랑이 뒤바뀜)
-        # 출처: Picamera2 Library Guide, "Image Formats"
-        # 여기서 RGB888을 쓰므로 뒤에서 cvtColor를 추가로 하면 안 된다 (다시 뒤바뀜).
-        controls = {"FrameRate": fps} if fps > 0 else {}
-        cfg = self.cam.create_video_configuration(
-            main={"size": (width, height), "format": "RGB888"},
-            controls=controls,
-        )
-        self.cam.configure(cfg)
-        self.cam.start()
-
-    def isOpened(self) -> bool:
-        return True
-
-    def read(self):
-        try:
-            return True, self.cam.capture_array()
-        except Exception:
-            return False, None
-
-    def get(self, _prop) -> float:
-        return 0.0
-
-    def release(self) -> None:
-        self.cam.stop()
-        self.cam.close()
+# --log CSV 열 (단위: *_ms 밀리초, *_s 초)
+LOG_FIELDS = [
+    "frame",          # 처리한 프레임 번호
+    "t_s",            # 프로그램 시작 후 프레임을 받은 시각
+    "status",         # ok / read_fail / infer_error
+    "sensor_ts_ns",   # 카메라 센서 촬영 시각 (Picamera2만)
+    "frame_dur_us",   # 카메라 프레임 간격 (Picamera2만)
+    "exposure_us",    # 노출 시간 (Picamera2만)
+    "read_ms",        # 카메라에서 프레임을 기다린 시간
+    "capture_age_ms", # 받았을 때 이미 지난 시간 = 받은 시각 - 촬영 시각 (크면 오래된 프레임이 큐에 쌓여 있었다는 뜻)
+    "pre_ms", "inf_ms", "post_ms",  # ultralytics 내부 측정: 전처리 / 모델 추론 / 후처리
+    "predict_ms",     # model.predict() 전체 (위 셋 + 부가 시간)
+    "mask_ms",        # 마스크 합치기/확장/칠하기
+    "out_ms",         # 분할 화면 만들기 + 파일 저장 + 화면 출력
+    "work_ms",        # 프레임 하나 처리에 실제로 쓴 시간 (read 대기 제외)
+    "sleep_ms",       # --fps 상한 때문에 쉰 시간
+    "latency_ms",     # 촬영 시각 -> 출력 완료까지 (Picamera2만)
+    "n_person", "max_conf", "min_conf",
+    "mask_frac",      # 화면에서 마스크가 차지하는 비율 (0~1)
+    "motion_frac",    # 직전 프레임 대비 움직인 픽셀 비율 (사람 없음 + 움직임 큼 = 미검출 의심)
+    "cpu_pct", "cpu_max_core", "cpu_temp", "cpu_mhz", "throttled",
+]
 
 
-def mask_people(frame: np.ndarray, result, color: tuple, dilate_px: int) -> np.ndarray:
-    """frame에서 사람 마스크 영역을 color로 채운 새 프레임을 반환한다."""
-    out = frame.copy()
+def person_union_mask(shape, result, dilate_px: int):
+    """사람 폴리곤을 모두 합친 0/255 마스크를 만든다. 사람이 없으면 None."""
     if result.masks is None or len(result.masks) == 0:
-        return out
-
-    h, w = frame.shape[:2]
+        return None
+    h, w = shape[:2]
     union = np.zeros((h, w), dtype=np.uint8)
     # masks.xy: 원본 해상도 좌표의 폴리곤 -> 후처리(리사이즈)가 필요 없어 가볍다
     for poly in result.masks.xy:
         if len(poly) >= 3:
             cv2.fillPoly(union, [poly.astype(np.int32)], 255)
-
     if dilate_px > 0:
         k = 2 * dilate_px + 1
         union = cv2.dilate(union, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    return union
 
-    out[union > 0] = color
-    return out
+
+def mask_people(frame: np.ndarray, result, color: tuple, dilate_px: int):
+    """frame에서 사람 영역을 color로 채운 새 프레임과, 사용한 마스크(없으면 None)를 반환한다."""
+    out = frame.copy()
+    union = person_union_mask(frame.shape, result, dilate_px)
+    if union is not None:
+        out[union > 0] = color
+    return out, union
 
 
 def side_by_side(original: np.ndarray, masked: np.ndarray, max_width: int) -> np.ndarray:
@@ -103,17 +101,6 @@ def export_model(args: argparse.Namespace) -> None:
     """라즈베리파이용 가벼운 포맷(ncnn/onnx)으로 변환한다. 결과는 weights 폴더 안에 생긴다."""
     path = YOLO(args.weights).export(format=args.export, imgsz=args.imgsz)
     print(f"변환 완료: {path}")
-
-
-def open_source(args: argparse.Namespace):
-    if args.source == "picamera":
-        return PiCamera(args.width, args.height, args.fps)
-    src = int(args.source) if args.source.isdigit() else args.source
-    cap = cv2.VideoCapture(src)
-    if isinstance(src, int):
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    return cap
 
 
 def parse_args() -> argparse.Namespace:
@@ -137,6 +124,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--view-width", type=int, default=1280, help="분할 화면 최대 가로 (0이면 축소 안 함)")
     p.add_argument("--no-show", action="store_true")
     p.add_argument("--fullscreen", action="store_true", help="전체화면 출력 (소형 디스플레이용)")
+    p.add_argument("--log", default=None,
+                   help="프레임별 진단 기록 CSV 경로 (예: runs/live.csv). tools/analyze_log.py로 분석")
+    p.add_argument("--low-latency", action="store_true",
+                   help="Picamera2 버퍼/큐를 줄여 오래된 프레임이 쌓이지 않게 한다 (지연 비교 실험용)")
     p.add_argument("--export", choices=["ncnn", "onnx"], help="모델 변환 후 종료")
     return p.parse_args()
 
@@ -149,23 +140,47 @@ def main() -> None:
 
     color = tuple(int(c) for c in args.color.split(","))
     model = YOLO(args.weights, task="segment")
+    # 첫 추론은 모델 준비 때문에 수백 ms 걸린다. 카메라 시작 전에 미리 한 번 돌려 둔다.
+    try:
+        model.predict(np.zeros((args.height, args.width, 3), np.uint8), imgsz=args.imgsz,
+                      device=args.device, verbose=False)
+    except Exception as e:
+        print(f"[경고] 모델 예열 실패: {e}")
 
     is_image = Path(args.source).suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}
 
-    def process(frame: np.ndarray) -> np.ndarray:
+    def process(frame: np.ndarray):
+        """(마스킹된 프레임, 진단 정보 dict)를 반환한다."""
+        info = {"status": "ok"}
         try:
+            t0 = time.perf_counter()
             res = model.predict(frame, imgsz=args.imgsz, conf=args.conf, classes=[PERSON_CLASS],
                                 device=args.device, verbose=False)[0]
-            return mask_people(frame, res, color, args.dilate)
+            t1 = time.perf_counter()
+            out, union = mask_people(frame, res, color, args.dilate)
+            t2 = time.perf_counter()
+            speed = getattr(res, "speed", None) or {}
+            confs = res.boxes.conf.tolist() if res.boxes is not None else []
+            info.update(
+                pre_ms=speed.get("preprocess"), inf_ms=speed.get("inference"),
+                post_ms=speed.get("postprocess"),
+                predict_ms=(t1 - t0) * 1e3, mask_ms=(t2 - t1) * 1e3,
+                n_person=len(confs),
+                max_conf=round(max(confs), 3) if confs else 0.0,
+                min_conf=round(min(confs), 3) if confs else None,
+                mask_frac=round(np.count_nonzero(union) / union.size, 4) if union is not None else 0.0,
+            )
+            return out, info
         except Exception as e:  # 실패 시 원본 노출 금지
             print(f"[오류] 추론 실패, 검은 화면 출력: {e}")
-            return np.zeros_like(frame)
+            info["status"] = "infer_error"
+            return np.zeros_like(frame), info
 
     if is_image:
         frame = cv2.imread(args.source)
         if frame is None:
             raise SystemExit(f"이미지를 읽을 수 없음: {args.source}")
-        out = process(frame)
+        out, _ = process(frame)
         view = out if args.single else side_by_side(frame, out, args.view_width)
         if args.save:
             cv2.imwrite(args.save, view)
@@ -175,7 +190,7 @@ def main() -> None:
             cv2.waitKey(0)
         return
 
-    cap = open_source(args)
+    cap = open_source(args.source, args.width, args.height, args.fps, args.low_latency)
     if not cap.isOpened():
         raise SystemExit(f"소스를 열 수 없음: {args.source}")
 
@@ -212,21 +227,37 @@ def main() -> None:
             written += 1
             duplicated += 1
 
+    # ---- 진단 로그 설정 ----
+    log_file = log_writer = sysmon = None
+    prev_small = None
+    if args.log:
+        Path(args.log).parent.mkdir(parents=True, exist_ok=True)
+        log_file = open(args.log, "w", newline="", encoding="utf-8")
+        log_writer = csv.DictWriter(log_file, fieldnames=LOG_FIELDS)
+        log_writer.writeheader()
+        sysmon = SysMonitor(interval=1.0)
+        print(f"진단 로그 기록: {args.log}")
+
     n, t0, next_t = 0, time.perf_counter(), time.perf_counter()
     try:
         while True:
+            t_read0 = time.perf_counter()
             ok, frame = cap.read()
             t_cap = time.perf_counter()  # 이 프레임이 실제로 들어온 시각
+            t_cap_ns = now_ns()
+            meta = getattr(cap, "last_meta", {}) if ok else {}
             if not ok:
                 if is_file:  # 영상 파일 끝
                     break
                 # 카메라 프레임을 못 받으면 원본이 없으므로 검은 화면 (fail-safe)
                 print("[오류] 프레임 읽기 실패, 검은 화면 출력")
                 frame = np.zeros(last_shape, dtype=np.uint8)
-                out = frame
+                out, info = frame, {"status": "read_fail"}
             else:
                 last_shape = frame.shape
-                out = process(frame)
+                out, info = process(frame)
+
+            t_out0 = time.perf_counter()
             view = out if args.single else side_by_side(frame, out, args.view_width)
 
             if args.save and writer is None:
@@ -244,21 +275,58 @@ def main() -> None:
                 written += 1
                 prev_view = view
 
+            quit_requested = False
+            if not args.no_show:
+                cv2.imshow(WINDOW, view)
+                quit_requested = (cv2.waitKey(1) & 0xFF) == ord("q")
+            t_out1 = time.perf_counter()
+            t_out_ns = now_ns()
+
             n += 1
             if n % 30 == 0:
                 print(f"평균 {n / (time.perf_counter() - t0):.1f} FPS")
-            if not args.no_show:
-                cv2.imshow(WINDOW, view)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
 
             # FPS 상한: 추론이 더 느리면 그대로 두고, 빠르면 남는 시간만큼 쉰다
-            next_t += frame_interval
-            wait = next_t - time.perf_counter()
-            if wait > 0:
-                time.sleep(wait)
-            else:
-                next_t = time.perf_counter()
+            sleep_s = 0.0
+            if not quit_requested:
+                next_t += frame_interval
+                wait = next_t - time.perf_counter()
+                if wait > 0:
+                    time.sleep(wait)
+                    sleep_s = wait
+                else:
+                    next_t = time.perf_counter()
+
+            if log_writer:
+                motion = None
+                if ok:  # 직전 프레임 대비 움직임 (작게 줄여 계산해서 부담이 거의 없음)
+                    small = cv2.cvtColor(cv2.resize(frame, (80, 60), interpolation=cv2.INTER_AREA),
+                                         cv2.COLOR_BGR2GRAY)
+                    if prev_small is not None:
+                        motion = round(float((cv2.absdiff(small, prev_small) > 25).mean()), 4)
+                    prev_small = small
+                sensor_ts = meta.get("SensorTimestamp")
+                row = {
+                    "frame": n,
+                    "t_s": round(t_cap - t0, 4),
+                    "sensor_ts_ns": sensor_ts,
+                    "frame_dur_us": meta.get("FrameDuration"),
+                    "exposure_us": meta.get("ExposureTime"),
+                    "read_ms": round((t_cap - t_read0) * 1e3, 2),
+                    "capture_age_ms": round((t_cap_ns - sensor_ts) / 1e6, 2) if sensor_ts else None,
+                    "out_ms": round((t_out1 - t_out0) * 1e3, 2),
+                    "work_ms": round((t_out1 - t_cap) * 1e3, 2),
+                    "sleep_ms": round(sleep_s * 1e3, 2),
+                    "latency_ms": round((t_out_ns - sensor_ts) / 1e6, 2) if sensor_ts else None,
+                    "motion_frac": motion,
+                }
+                for k, v in info.items():
+                    row[k] = round(v, 2) if isinstance(v, float) and k.endswith("_ms") else v
+                row.update(sysmon.sample())
+                log_writer.writerow(row)
+
+            if quit_requested:
+                break
     except KeyboardInterrupt:  # Ctrl+C로 정상 종료 (요약을 출력하고 파일을 닫는다)
         pass
     finally:
@@ -268,6 +336,8 @@ def main() -> None:
             if not is_file:
                 write_until(t_end)  # 마지막 프레임 이후 ~ 종료 시점까지 채우기
             writer.release()
+        if log_file:
+            log_file.close()
         cv2.destroyAllWindows()
 
         elapsed = t_end - t0
@@ -279,6 +349,8 @@ def main() -> None:
                   f"-> 재생 길이 {written / record_fps:.1f} 초")
             if not is_file:
                 print(f"  (그중 시간 맞추기용 반복 프레임: {duplicated} 장)")
+        if args.log:
+            print(f"진단 로그: {args.log}\n  분석: python tools/analyze_log.py {args.log}")
 
 
 if __name__ == "__main__":
