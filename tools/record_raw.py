@@ -13,6 +13,7 @@
 """
 import argparse
 import csv
+import signal
 import sys
 import time
 from pathlib import Path
@@ -24,7 +25,14 @@ from camera import open_source  # noqa: E402
 from metrics import sensor_drops, stats  # noqa: E402
 
 
+def _stop(*_):
+    raise KeyboardInterrupt
+
+
 def main() -> None:
+    # 백그라운드 실행에서 kill(SIGTERM)로 끝내도 영상 파일을 정상적으로 닫는다
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, _stop)
     p = argparse.ArgumentParser()
     p.add_argument("--source", default="picamera")
     p.add_argument("--width", type=int, default=640)
@@ -33,13 +41,22 @@ def main() -> None:
     p.add_argument("--seconds", type=float, default=30, help="녹화 시간 (Ctrl+C로 먼저 끝낼 수 있음)")
     p.add_argument("--out", default="runs/raw.mp4")
     p.add_argument("--low-latency", action="store_true")
+    p.add_argument("--no-af", action="store_true", help="연속 자동초점 끄기")
+    p.add_argument("--stream", type=int, default=0, metavar="PORT",
+                   help="녹화 중인 원본을 브라우저로 보기 (예: 8000). 화면 구도 확인용")
     args = p.parse_args()
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     log_path = str(Path(args.out).with_suffix(".csv"))
-    cap = open_source(args.source, args.width, args.height, args.fps, args.low_latency)
+    cap = open_source(args.source, args.width, args.height, args.fps, args.low_latency,
+                      autofocus=not args.no_af)
     if not cap.isOpened():
         raise SystemExit(f"소스를 열 수 없음: {args.source}")
+    streamer = None
+    if args.stream:
+        from stream import MJPEGStreamer
+        streamer = MJPEGStreamer(args.stream)
+        print(f"녹화 화면 확인: http://dontlookme.local:{args.stream} (원본이 전송됨, 개발용)")
 
     writer = None
     ts, fds, write_ms = [], [], []
@@ -62,6 +79,8 @@ def main() -> None:
                         raise SystemExit(f"영상 파일을 열 수 없음: {args.out}")
                 writer.write(frame)
                 wm = (time.perf_counter() - t) * 1e3
+                if streamer:
+                    streamer.update(frame)
                 meta = getattr(cap, "last_meta", {})
                 n += 1
                 ts.append(meta.get("SensorTimestamp"))
@@ -76,6 +95,8 @@ def main() -> None:
             cap.release()
             if writer:
                 writer.release()
+            if streamer:
+                streamer.close()
 
     print("\n===== 원본 녹화 요약 =====")
     print(f"경과 {elapsed:.1f}초, 받은 프레임 {n}장 ({n / elapsed if elapsed else 0:.1f} FPS)")
