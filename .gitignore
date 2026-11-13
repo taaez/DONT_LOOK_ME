@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 녹화/테스트 결과물 (원본 영상에 사람이 찍혀 있을 수 있으므로 올리지 않음)
+*.mp4
+*.avi
+*.mov
+out*.jpg
+*.csv
+
+# 변환된 모델 (각 기기에서 --export로 다시 생성)
+weights/*_ncnn_model/
+weights/*.onnx
+
+# OS
+.DS_Store

@@ -1,0 +1,6 @@
+# PC / 라즈베리파이 공용. 라즈베리파이 OS(Bookworm)에서는 아래 안내 참고.
+ultralytics
+opencv-python        # 라즈베리파이: sudo apt install python3-opencv 권장 (pip 대신)
+numpy
+# 라즈베리파이 CSI 카메라: sudo apt install python3-picamera2  (venv는 --system-site-packages로 생성)
+# NCNN 변환(--export ncnn) 시 ultralytics가 ncnn/pnnx를 자동 설치한다
