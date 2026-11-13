@@ -26,6 +26,7 @@ DONT_LOOK_ME/
 ├── docs/
 │   ├── 실행방법.md         # 설치·실행·옵션·문제 해결
 │   ├── 프레임진단.md       # 마스킹 누락 원인 진단 방법
+│   ├── 학습자료/           # 팀원용 작업 정리·개념 설명
 │   ├── 실험결과/           # 날짜별 실험 결과 (예: 261113 기준선 및 main vs seok 비교)
 │   └── 계획/               # 앞으로 할 일 (예: 261113 Hailo 도입 계획)
 └── requirements.txt
@@ -64,6 +65,7 @@ python tools/analyze_log.py runs/live.csv --plot runs/live.png
 
 ## 최근 실험
 
+- [261113 작업 정리 및 학습 자료 (팀원용, 처음 읽을 문서)](docs/학습자료/261113_작업정리_및_학습자료.md)
 - [261113 CPU 기준선 및 main vs seok 비교](docs/실험결과/261113_기준선_및_main_vs_seok_비교.md)
 - [261113 Hailo 도입 계획 및 FPS·지연 목표](docs/계획/261113_Hailo_도입_계획.md)
 
