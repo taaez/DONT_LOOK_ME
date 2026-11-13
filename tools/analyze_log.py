@@ -56,7 +56,8 @@ def main() -> None:
     p.add_argument("--conf", type=float, default=0.25, help="실행 때 쓴 --conf (경계선 신뢰도 판정용)")
     p.add_argument("--target-fps", type=float, default=15,
                    help="카메라 타임스탬프가 없을 때(웹캠/파일) 쓸 목표 FPS")
-    p.add_argument("--max-gap", type=int, default=3, help="이 프레임 수 이하로 끊긴 검출은 미검출 의심")
+    p.add_argument("--max-gap-s", type=float, default=2.0,
+                   help="앞뒤로 검출됐는데 이 시간(초) 이하로 끊긴 구간은 미검출 의심 (사람이 2초 안에 나갔다 들어오기는 드묾)")
     p.add_argument("--motion", type=float, default=0.03, help="움직임 비율이 이보다 큰데 사람 0명이면 의심")
     p.add_argument("--plot", default=None, help="그래프 PNG 저장 경로")
     args = p.parse_args()
@@ -189,24 +190,44 @@ def main() -> None:
     if temp["max"] and temp["max"] >= 80:
         findings.append(("B CPU", f"CPU 온도 {temp['max']:.0f}°C (80°C 이상이면 성능 제한 시작)"))
     if cpu["mean"] is not None and core["mean"] is not None and cpu["mean"] < 50 and core["mean"] > 90:
-        findings.append(("B CPU", "한 코어만 바쁘고 나머지는 놀고 있음 -> 단일 스레드 병목"))
+        findings.append(("B CPU", f"CPU 4코어를 다 못 씀 (전체 평균 {cpu['mean']:.0f}%, 가장 바쁜 코어 {core['mean']:.0f}%) "
+                                 "-> 멀티코어 활용이 좋은 NCNN 변환으로 비교"))
 
     # ------------------------------------------------------------ [C] 모델
     section("[C] 모델: 사람을 놓친 것으로 의심되는 프레임")
     has = [(r["n_person"] or 0) > 0 for r in ok]
     n_det = sum(has)
-    gaps = find_short_gaps(has, args.max_gap)
+    # 프레임 수가 아니라 시간으로 판정 (처리 FPS가 낮으면 같은 0.5초 끊김도 프레임 수가 적어 보이므로)
+    period = dur / max(len(rows) - 1, 1)
+    max_gap = max(int(round(args.max_gap_s / period)), 1) if period > 0 else 3
+    gaps = find_short_gaps(has, max_gap)
     gap_idx = {i for a, b in gaps for i in range(a, b + 1)}
     print(f"사람 검출 프레임 {n_det}장 / 미검출 {len(ok) - n_det}장")
     if n_det == 0:
         print("사람이 한 번도 검출되지 않음 -> 사람이 화면에 있었다면 모델/설정 문제가 매우 큼")
     miss_rate = len(gap_idx) / max(n_det + len(gap_idx), 1)
-    print(f"[의심1] 앞뒤는 검출됐는데 {args.max_gap}프레임 이하로 끊긴 프레임: {len(gap_idx)}장 "
+    print(f"[의심1] 앞뒤는 검출됐는데 {args.max_gap_s:g}초({max_gap}프레임) 이하로 끊긴 프레임: {len(gap_idx)}장 "
           f"({len(gaps)}구간), 사람 등장 프레임 대비 {miss_rate:.1%}")
-    for a, b in gaps[:15]:
-        print(f"    프레임 {int(ok[a]['frame'])}~{int(ok[b]['frame'])} (t={ok[a]['t_s']:.2f}s)")
-    if len(gaps) > 15:
-        print(f"    ... 외 {len(gaps) - 15}구간")
+
+    # 검출 없는 구간 전체 목록 (녹화 영상의 같은 시각과 맞춰 보며 확인)
+    segs, i = [], 0
+    while i < len(ok):
+        if has[i]:
+            i += 1
+            continue
+        j = i
+        while j < len(ok) and not has[j]:
+            j += 1
+        segs.append((i, j - 1))
+        i = j
+    print("\n검출 없는 구간 전체 (★ = 의심1에 해당):")
+    for a, b in segs[:40]:
+        mot = max((ok[k].get("motion_frac") or 0) for k in range(a, b + 1))
+        kind = "★ 짧게 끊김" if a in gap_idx else ("앞뒤 검출됨(긴 구간)" if a > 0 and b < len(ok) - 1 else "시작/끝")
+        print(f"    {ok[a]['t_s']:7.1f} ~ {ok[b]['t_s']:7.1f}초  {b - a + 1:4d}장  {kind:<14} 최대 움직임 {mot:.2f}")
+    if len(segs) > 40:
+        print(f"    ... 외 {len(segs) - 40}구간")
+    print("    (움직임 0.3 이상 = 화면 대부분이 바뀜: 카메라 바로 앞을 지나가거나 카메라가 움직인 경우)")
     motion_sus = [i for i, r in enumerate(ok) if not has[i] and i not in gap_idx
                   and (r.get("motion_frac") or 0) > args.motion]
     print(f"[의심2] 사람 0명인데 화면 움직임이 큰 프레임 (조명 변화일 수도 있음): {len(motion_sus)}장")
